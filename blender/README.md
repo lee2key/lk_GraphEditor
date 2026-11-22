@@ -4,7 +4,7 @@
 
 ## Установка и первый запуск
 
-1. В Blender откройте **Edit → Preferences → Get Extensions**, нажмите стрелку меню справа сверху, выберите **Install from Disk** и укажите `animation_graph_editor.zip` из этой папки.
+1. В Blender откройте **Edit → Preferences → Get Extensions**, нажмите стрелку меню справа сверху, выберите **Install from Disk** и укажите архив `lk_GraphEditor-Blender-*.zip` из [GitHub Releases](https://github.com/lee2key/lk_GraphEditor/releases) или локальный архив `blender/animation_graph_editor.zip`.
 2. Выберите объект, наведите курсор на область, где нужен редактор, и нажмите **F3 → Animation Graph Editor**. В Timeline редактор также открывается иконкой кривой справа от **Playback**.
 3. В меню каналов выберите, например, **Location Z**. Дважды щёлкните в двух местах графика и нажмите **Space**, чтобы увидеть движение объекта.
 4. Нажмите **Esc** над графиком или кнопку с иконкой кривой в заголовке, чтобы вернуться к прежнему редактору. Анимация сохраняется в обычном Action внутри файла `.blend`.

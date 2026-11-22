@@ -1,6 +1,6 @@
-# Animation Graph Editor for Houdini and Blender
+# lk_GraphEditor
 
-A small Houdini Python Panel for inspecting and editing keyframes on numeric parameters of the selected node.
+Animation graph editors for Houdini and Blender.
 
 ## Blender 4.5+
 
@@ -12,16 +12,14 @@ See the [Blender guide](blender/README.md) for all shortcuts and build instructi
 
 ## Houdini
 
-Download and extract the Houdini ZIP from [GitHub Releases](https://github.com/lee2key/lk_GraphEditor/releases).
+### Install
 
-## Install
-
-1. Copy this project folder somewhere permanent.
+1. Extract the Houdini ZIP from [GitHub Releases](https://github.com/lee2key/lk_GraphEditor/releases) to a permanent folder, for example `C:/tools/lk_GraphEditor`. The folder should directly contain `package`, `python_panels`, and `scripts`.
 2. Copy `package/houdini_animation_editor.json` into your Houdini preferences `packages` directory (for example, `Documents/houdini22.0/packages`).
-3. Edit the copied JSON so its `hpath` value is the absolute path to this project. Example:
+3. Edit the copied JSON so its `hpath` value points to the folder you extracted. Example:
 
    ```json
-   { "hpath": "C:/tools/houdini_animation_graph" }
+   { "hpath": "C:/tools/lk_GraphEditor" }
    ```
 
 4. Restart Houdini. In any pane's type menu, choose **Animation Graph Editor**.
