@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -21,6 +22,7 @@ def create_interface():
 def destroy_interface():
     global _EDITOR
     if _EDITOR is not None:
+        _EDITOR.stop_listening()
         _EDITOR.deleteLater()
     _EDITOR = None
 
@@ -46,10 +48,16 @@ class CurveCanvas(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._selection_text = ""
+        self._curve_color = QtGui.QColor("#ff9d36")
         self._keys = []
         self._selected_frames = set()
         self._selected_handles = set()
         self._sample = lambda frame: 0.0
+        self._path_view = None
+        self._cached_path = None
+        self._graph_view = None
+        self._graph_pixmap = None
         self._range = (1.0, 24.0, -1.0, 1.0)
         self._press_position = None
         self._drag_rect = None
@@ -71,14 +79,14 @@ class CurveCanvas(QtWidgets.QWidget):
         self._pan_start_range = None
         self._fit_x_on_next_curve = True
         self._current_frame = hou.frame()
-        self._playhead_timer = QtCore.QTimer(self)
-        self._playhead_timer.timeout.connect(self._update_playhead)
-        self._playhead_timer.start(100)
         self.setMinimumHeight(220)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
 
-    def set_curve(self, keys, sample):
+    def set_curve(self, keys, sample, color="#ff9d36"):
+        self._curve_color = QtGui.QColor(color)
+        self._path_view = None
+        self._graph_view = None
         had_keys = bool(self._keys)
         self._keys = keys
         existing_frames = {key.frame() for key in keys}
@@ -99,8 +107,7 @@ class CurveCanvas(QtWidgets.QWidget):
         self._fit_x_on_next_curve = True
 
     def fit_all(self):
-        fitted_range = self._curve_range(self._keys)
-        self._range = (fitted_range[0], fitted_range[1], self._range[2], self._range[3])
+        self._range = self._curve_range(self._keys)
         self.update()
 
     def fit_selected(self):
@@ -115,7 +122,13 @@ class CurveCanvas(QtWidgets.QWidget):
         else:
             frame_span = frames[-1] - frames[0]
             padding = max(1.0, frame_span * 0.1)
-            self._range = (frames[0] - padding, frames[-1] + padding, bottom, top)
+            values = [key.value() for key in self.selected_keys()]
+            low, high = min(values), max(values)
+            value_span = high - low
+            # Equal-valued keys still need a nonzero vertical viewing range.
+            value_padding = value_span * 0.15 if value_span > 0 else max(0.5, abs(low) * 0.05)
+            self._range = (frames[0] - padding, frames[-1] + padding,
+                           low - value_padding, high + value_padding)
         self.update()
 
     def set_selected_frames(self, frames):
@@ -123,6 +136,7 @@ class CurveCanvas(QtWidgets.QWidget):
         if selected != self._selected_frames:
             self._selected_handles.clear()
             self._selected_frames = selected
+            self._graph_view = None
             self.update()
 
     @property
@@ -138,17 +152,24 @@ class CurveCanvas(QtWidgets.QWidget):
 
     def _set_handle_selection(self, directions):
         self._selected_handles = set(directions)
+        self._graph_view = None
         self.selectionChanged.emit(sorted(self._selected_frames))
         self.update()
 
     def select_all(self):
         self._set_selection(key.frame() for key in self._keys)
 
-    def _update_playhead(self):
-        frame = hou.frame()
-        if frame != self._current_frame:
-            self._current_frame = frame
-            self.update()
+    def set_playhead(self, frame):
+        if frame == self._current_frame:
+            return
+        previous = self._current_frame
+        self._current_frame = frame
+        left, right, bottom, _ = self._range
+        rect = self._plot_rect()
+        for marker in (previous, frame):
+            if left <= marker <= right:
+                x = math.floor(self._to_point(marker, bottom).x())
+                self.update(QtCore.QRect(x - 28, rect.top() - 2, 57, rect.height() + 4))
 
     @staticmethod
     def _curve_range(keys):
@@ -179,19 +200,29 @@ class CurveCanvas(QtWidgets.QWidget):
         return (left + x_ratio * (right - left), bottom + y_ratio * (top - bottom))
 
     def _curve_path(self):
+        view = (self._range, self.size())
+        if self._path_view != view:
+            self._cached_path = self._build_curve_path()
+            self._path_view = view
+        return self._cached_path
+
+    def _build_curve_path(self):
         if not self._keys:
             return None
-        left, right, _, _ = self._range
+        left, right, bottom, top = self._range
         path = QtGui.QPainterPath()
         # Split at every visible key, then sample in screen pixels, not frames.
         # This hits sharp extrema exactly even at subframe zoom levels.
-        boundaries = sorted({left, right} | {
-            key.frame() for key in self._keys if left < key.frame() < right
-        })
-        pixels_per_frame = max(1, self._plot_rect().width()) / (right - left)
+        key_frames = [key.frame() for key in self._keys]
+        boundaries = [left, *(frame for frame in key_frames if left < frame < right), right]
+        rect = self._plot_rect()
+        x_origin, y_origin = rect.left(), rect.bottom()
+        pixels_per_frame = max(1, rect.width()) / (right - left)
+        pixels_per_value = rect.height() / (top - bottom)
         has_point = False
         for start, end in zip(boundaries, boundaries[1:]):
-            active_key = next((key for key in reversed(self._keys) if key.frame() <= start), None)
+            index = bisect_right(key_frames, start) - 1
+            active_key = self._keys[index] if index >= 0 else None
             constant = False
             if active_key is not None:
                 try:
@@ -204,50 +235,44 @@ class CurveCanvas(QtWidgets.QWidget):
                 start + (end - start) * index / (sample_count - 1)
                 for index in range(sample_count)
             ]
+            start_y = None
             for frame in frames:
                 try:
                     value = float(self._sample(frame))
-                    point = self._to_point(frame, value)
                     if not math.isfinite(value):
                         has_point = False
                         continue
                 except (hou.Error, ValueError, TypeError):
                     has_point = False
                     continue
+                x = x_origin + (frame - left) * pixels_per_frame
+                y = y_origin - (value - bottom) * pixels_per_value
+                if frame == start:
+                    start_y = y
                 if has_point:
-                    if constant and frame == end:
+                    if constant and frame == end and start_y is not None:
                         # Draw an exact horizontal hold followed by a vertical step.
-                        path.lineTo(self._to_point(frame, float(self._sample(start))))
-                    path.lineTo(point)
+                        path.lineTo(x, start_y)
+                    path.lineTo(x, y)
                 else:
-                    path.moveTo(point)
+                    path.moveTo(x, y)
                     has_point = True
         return path if has_point else None
 
     def _is_scrub_gesture(self, position):
-        rect = self._plot_rect()
-        if not rect.contains(position.toPoint()):
+        left, right = self._range[:2]
+        if not left <= self._current_frame <= right:
             return False
-        playhead_x = self._to_point(self._current_frame, self._range[2]).x()
-        return position.y() <= rect.top() + 20 or abs(position.x() - playhead_x) <= 4
+        rect = self._plot_rect()
+        x = self._to_point(self._current_frame, self._range[2]).x()
+        return QtCore.QRectF(x - 26, rect.top() + 2, 52, 16).contains(position)
 
     def _set_frame_from_position(self, position):
         frame, _ = self._from_point(position)
-        hou.setFrame(round(frame))
-        self._current_frame = hou.frame()
-        self.update()
-
-    def _curve_at(self, position):
-        path = self._curve_path()
-        if path is None:
-            return False
-        stroker = QtGui.QPainterPathStroker()
-        stroker.setWidth(10)
-        return stroker.createStroke(path).contains(position)
-
-    def _curve_intersects(self, rect):
-        path = self._curve_path()
-        return path is not None and path.intersects(rect)
+        target = round(frame)
+        if target != self._current_frame:
+            hou.setFrame(target)
+            self.set_playhead(hou.frame())
 
     def _time_grid_frames(self):
         left, right, _, _ = self._range
@@ -423,7 +448,32 @@ class CurveCanvas(QtWidgets.QWidget):
         self.update()
 
     def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
+        ratio = self.devicePixelRatioF()
+        view = (self._range, self.size(), ratio, self.font())
+        if view != self._graph_view:
+            pixmap = QtGui.QPixmap(math.ceil(self.width() * ratio), math.ceil(self.height() * ratio))
+            pixmap.setDevicePixelRatio(ratio)
+            with QtGui.QPainter(pixmap) as painter:
+                painter.setFont(self.font())
+                self._paint_graph(painter)
+            self._graph_pixmap = pixmap
+            self._graph_view = view
+
+        with QtGui.QPainter(self) as painter:
+            painter.drawPixmap(0, 0, self._graph_pixmap)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            self._paint_playhead(painter)
+            if self._drag_rect is not None:
+                painter.setBrush(QtGui.QColor(92, 200, 255, 35))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#5cc8ff"), 1, QtCore.Qt.PenStyle.DashLine))
+                painter.drawRect(self._drag_rect)
+            if self._selection_text:
+                rect = QtCore.QRectF(self._plot_rect()).adjusted(8, 0, -8, -8)
+                painter.setPen(QtGui.QColor("#e6e6e6"))
+                painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom,
+                                 self._selection_text)
+
+    def _paint_graph(self, painter):
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), QtGui.QColor("#252525"))
         rect = self._plot_rect()
@@ -434,7 +484,7 @@ class CurveCanvas(QtWidgets.QWidget):
         grid_frames = self._time_grid_frames()
         for frame in grid_frames:
             x = self._to_point(frame, self._range[2]).x()
-            painter.drawLine(QtCore.QPointF(x, rect.top()), QtCore.QPointF(x, rect.bottom()))
+            painter.drawLine(QtCore.QPointF(x, rect.top() + 18), QtCore.QPointF(x, rect.bottom()))
         for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
             y = rect.top() + ratio * rect.height()
             painter.drawLine(QtCore.QPointF(rect.left(), y), QtCore.QPointF(rect.right(), y))
@@ -443,24 +493,6 @@ class CurveCanvas(QtWidgets.QWidget):
         left, right, bottom, top = self._range
         painter.drawText(4, 18, "{:.2f}".format(top))
         painter.drawText(4, rect.bottom(), "{:.2f}".format(bottom))
-        for frame in grid_frames:
-            x = self._to_point(frame, bottom).x()
-            label_rect = QtCore.QRectF(x - 30, rect.bottom() + 4, 60, 20)
-            painter.drawText(label_rect, QtCore.Qt.AlignmentFlag.AlignCenter, "{:.0f}".format(frame))
-
-        if left <= self._current_frame <= right:
-            playhead_x = self._to_point(self._current_frame, bottom).x()
-            painter.setPen(QtGui.QPen(QtGui.QColor("#62d6ff"), 1))
-            painter.drawLine(QtCore.QPointF(playhead_x, rect.top()),
-                             QtCore.QPointF(playhead_x, rect.bottom()))
-            label_rect = QtCore.QRectF(playhead_x - 26, rect.top() + 2, 52, 16)
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(QtGui.QColor("#176b89"))
-            painter.drawRoundedRect(label_rect, 3, 3)
-            painter.setPen(QtGui.QColor("#e6f7ff"))
-            painter.drawText(label_rect, QtCore.Qt.AlignmentFlag.AlignCenter,
-                             "{:.3g}".format(self._current_frame))
-
         if self._keys:
             path = self._curve_path()
             if path is not None:
@@ -479,7 +511,8 @@ class CurveCanvas(QtWidgets.QWidget):
                     x_end = self._to_point(end, bottom).x()
                     painter.save()
                     painter.setClipRect(QtCore.QRectF(x_start, rect.top(), x_end - x_start, rect.height()))
-                    pen = QtGui.QPen(QtGui.QColor("#b87936" if extension else "#ff9d36"), 2)
+                    color = self._curve_color.darker(145) if extension else self._curve_color
+                    pen = QtGui.QPen(color, 2)
                     if extension:
                         pen.setStyle(QtCore.Qt.PenStyle.DashLine)
                     painter.setPen(pen)
@@ -509,16 +542,34 @@ class CurveCanvas(QtWidgets.QWidget):
                     painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
                 painter.drawRect(QtCore.QRectF(handle_point.x() - 4, handle_point.y() - 4, 8, 8))
 
-        if self._drag_rect is not None:
-            painter.setBrush(QtGui.QColor(92, 200, 255, 35))
-            painter.setPen(QtGui.QPen(QtGui.QColor("#5cc8ff"), 1, QtCore.Qt.PenStyle.DashLine))
-            painter.drawRect(self._drag_rect)
+        ruler = QtCore.QRectF(rect.left(), rect.top(), rect.width(), 18)
+        painter.fillRect(ruler, QtGui.QColor("#1a1a1a"))
+        painter.setPen(QtGui.QColor("#a6a6a6"))
+        for frame in grid_frames:
+            x = self._to_point(frame, bottom).x()
+            label_rect = QtCore.QRectF(x - 30, rect.top() + 2, 60, 16)
+            painter.drawText(label_rect, QtCore.Qt.AlignmentFlag.AlignCenter, "{:.0f}".format(frame))
+
+    def _paint_playhead(self, painter):
+        left, right, bottom, _ = self._range
+        if left <= self._current_frame <= right:
+            rect = self._plot_rect()
+            x = self._to_point(self._current_frame, bottom).x()
+            painter.setPen(QtGui.QPen(QtGui.QColor("#62d6ff"), 1))
+            painter.drawLine(QtCore.QPointF(x, rect.top() + 18), QtCore.QPointF(x, rect.bottom()))
+            label = QtCore.QRectF(x - 26, rect.top() + 2, 52, 16)
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(QtGui.QColor("#176b89"))
+            painter.drawRoundedRect(label, 3, 3)
+            painter.setPen(QtGui.QColor("#e6f7ff"))
+            painter.drawText(label, QtCore.Qt.AlignmentFlag.AlignCenter, "{:.3g}".format(self._current_frame))
 
     def _set_selection(self, frames):
         frames = set(frames)
         had_handles = bool(self._selected_handles)
         self._selected_handles.clear()
         if frames != self._selected_frames or had_handles:
+            self._graph_view = None
             self._selected_frames = frames
             self.selectionChanged.emit(sorted(frames))
         self.update()
@@ -688,8 +739,6 @@ class CurveCanvas(QtWidgets.QWidget):
                     directions = self._selected_handles | box_handles if self._shift_at_press else box_handles
                     self._set_handle_selection(directions)
                 else:
-                    if not box_frames and self._curve_intersects(self._drag_rect):
-                        box_frames = {key.frame() for key in self._keys}
                     selection = self._selected_frames | box_frames if self._shift_at_press else box_frames
                     self._set_selection(selection)
             else:
@@ -706,11 +755,6 @@ class CurveCanvas(QtWidgets.QWidget):
                     self._set_selection(selection)
                 else:
                     self._set_selection({key.frame()})
-                if key is None and self._curve_at(event.position()):
-                    selection = {curve_key.frame() for curve_key in self._keys}
-                    if self._shift_at_press:
-                        selection |= self._selected_frames
-                    self._set_selection(selection)
             self._press_position = None
             self._pressed_key = None
             self._drag_rect = None
@@ -753,30 +797,102 @@ class CurveCanvas(QtWidgets.QWidget):
 class AnimationGraphEditor(QtWidgets.QWidget):
     """Panel UI and safe wrappers around Houdini parameter keyframe operations."""
 
+    _CHANNEL_EVENTS = (hou.nodeEventType.ParmTupleAnimated, hou.nodeEventType.ParmTupleChannelChanged)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._node = None
+        self._copied_keys = []
         self._building = False
+        self._listening = False
+        self._watched_node = None
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self.refresh)
+        # Scripted time changes can bypass the playbar's FrameChanged event.
+        self._frame_timer = QtCore.QTimer(self)
+        self._frame_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._frame_timer.setInterval(16)
+        self._frame_timer.timeout.connect(self._sync_frame)
         self.setProperty("houdiniStyle", True)
         self._build_ui()
         self.set_node(self._selected_node())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._listening:
+            if hou.isUIAvailable():
+                hou.playbar.addEventCallback(self._on_playbar_event)
+            self._listening = True
+            self._watch_node(self._node)
+            self._sync_frame()
+            self._frame_timer.start()
+            self.refresh()
+
+    def hideEvent(self, event):
+        self.stop_listening()
+        super().hideEvent(event)
+
+    def stop_listening(self):
+        self._frame_timer.stop()
+        if self._listening:
+            self._listening = False
+            if hou.isUIAvailable():
+                try:
+                    hou.playbar.removeEventCallback(self._on_playbar_event)
+                except hou.Error:
+                    pass  # The host may already have cleared callbacks while closing.
+        self._watch_node(None)
+        self._refresh_timer.stop()
+
+    def _on_playbar_event(self, event_type, frame):
+        if event_type == hou.playbarEvent.FrameChanged:
+            self.canvas.set_playhead(frame)
+
+    def _sync_frame(self):
+        self.canvas.set_playhead(hou.frame())
+
+    def _watch_node(self, node):
+        if self._watched_node == node:
+            return
+        if self._watched_node is not None:
+            try:
+                self._watched_node.removeEventCallback(self._CHANNEL_EVENTS, self._on_channel_edit)
+            except hou.Error:
+                pass  # A deleted node no longer owns its callback.
+        self._watched_node = None
+        if node is not None:
+            try:
+                node.addEventCallback(self._CHANNEL_EVENTS, self._on_channel_edit)
+                self._watched_node = node
+            except hou.ObjectWasDeleted:
+                pass
+
+    def _on_channel_edit(self, parm_tuple=None, **kwargs):
+        self._refresh_timer.start(0)
 
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
 
         header = QtWidgets.QHBoxLayout()
-        self.node_label = QtWidgets.QLabel("No node selected")
-        self.node_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.refresh_button = QtWidgets.QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self.refresh)
-        header.addWidget(self.node_label, 1)
-        header.addWidget(self.refresh_button)
-        root.addLayout(header)
-
         self.parm_combo = QtWidgets.QComboBox()
         self.parm_combo.currentIndexChanged.connect(self._on_parm_changed)
-        root.addWidget(self.parm_combo)
+        header.addWidget(self.parm_combo, 1)
+        self.mode_buttons = {}
+        for mode, label, hotkey in (("automatic", "Bezier", 1), ("linear", "Linear", 2),
+                                    ("constant", "Constant", 3)):
+            button = QtWidgets.QToolButton()
+            button.setAccessibleName(label)
+            button.setToolTip(f"{label} ({hotkey})")
+            button.setCheckable(True)
+            button.setIcon(self._mode_icon(mode))
+            button.setIconSize(QtCore.QSize(24, 20))
+            button.setStyleSheet("QToolButton:checked { background: #176b89; border: 1px solid #62d6ff; }")
+            button.clicked.connect(lambda checked=False, mode=mode: self.set_selected_interpolation(mode))
+            self.mode_buttons[mode] = button
+            header.addWidget(button)
+        root.addLayout(header)
 
         self.canvas = CurveCanvas()
         self.canvas.keyRequested.connect(self._add_key_at)
@@ -789,9 +905,6 @@ class AnimationGraphEditor(QtWidgets.QWidget):
         self.canvas.tangentTransformFinished.connect(self._finish_tangent_transform)
         root.addWidget(self.canvas, 1)
 
-        self.selection_info = QtWidgets.QLabel("No keys selected.")
-        root.addWidget(self.selection_info)
-
         self.delete_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Delete"), self)
         self.delete_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.delete_shortcut.activated.connect(self.delete_selected_keys)
@@ -801,6 +914,12 @@ class AnimationGraphEditor(QtWidgets.QWidget):
         self.select_all_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+A"), self)
         self.select_all_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.select_all_shortcut.activated.connect(self.select_all_keys)
+        self.copy_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+C"), self)
+        self.copy_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.copy_shortcut.activated.connect(self.copy_selected_keys)
+        self.paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+V"), self)
+        self.paste_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.paste_shortcut.activated.connect(self.paste_keys)
         self.fit_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F"), self)
         self.fit_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.fit_shortcut.activated.connect(self.fit_view)
@@ -819,6 +938,35 @@ class AnimationGraphEditor(QtWidgets.QWidget):
             shortcut.activated.connect(lambda mode=mode: self.canvas.start_tangent_transform(mode))
             self.transform_shortcuts.append(shortcut)
 
+        self.transport_shortcuts = []
+        for sequence, callback in (("Space", self.toggle_playback),
+                                   ("Shift+Space", self.go_to_start_frame),
+                                   ("Ctrl+Space", self.toggle_maximized)):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(callback)
+            self.transport_shortcuts.append(shortcut)
+
+    def toggle_playback(self):
+        if hou.playbar.isPlaying():
+            hou.playbar.stop()
+        else:
+            hou.playbar.play()
+
+    def go_to_start_frame(self):
+        hou.playbar.stop()
+        hou.setFrame(hou.playbar.playbackRange()[0])
+        self.canvas.set_playhead(hou.frame())
+
+    def toggle_maximized(self):
+        for tab in hou.ui.paneTabs():
+            if tab.type() == hou.paneTabType.PythonPanel and tab.activeInterfaceRootWidget() is self:
+                pane = tab.pane()
+                if pane is not None:
+                    pane.setIsMaximized(not pane.isMaximized())
+                return
+
     @staticmethod
     def _selected_node():
         nodes = hou.selectedNodes()
@@ -829,19 +977,48 @@ class AnimationGraphEditor(QtWidgets.QWidget):
         if node is None:
             return []
         numeric_types = {hou.parmTemplateType.Float, hou.parmTemplateType.Int}
-        return [parm for parm in node.parms() if parm.parmTemplate().type() in numeric_types]
+        return [parm for parm in node.parms()
+                if parm.parmTemplate().type() in numeric_types and parm.keyframes()]
+
+    @staticmethod
+    def _parm_label(parm):
+        label = parm.description() or parm.name()
+        components = list(parm.tuple())
+        if len(components) > 1:
+            index = components.index(parm)
+            base = parm.tuple().name()
+            suffix = parm.name()[len(base):] if parm.name().startswith(base) else ""
+            component = suffix.upper() if suffix else str(index + 1)
+            label = "{} {}".format(label, component)
+        return label
+
+    def _sync_parm_list(self):
+        parms = self._numeric_parms(self._node)
+        paths = [parm.path() for parm in parms]
+        if paths == [self.parm_combo.itemData(i) for i in range(self.parm_combo.count())]:
+            return
+        previous = self.parm_combo.currentData()
+        blocker = QtCore.QSignalBlocker(self.parm_combo)
+        self.parm_combo.clear()
+        for parm in parms:
+            self.parm_combo.addItem(self._parm_label(parm), parm.path())
+        index = self.parm_combo.findData(previous)
+        if index >= 0:
+            self.parm_combo.setCurrentIndex(index)
+        if self.parm_combo.currentData() != previous:
+            self.canvas.reset_view()
+        del blocker
 
     def set_node(self, node):
         self.canvas.finish_tangent_transform(cancel=True)
         self._node = node
+        if self._listening:
+            self._watch_node(node)
         self._building = True
         self.parm_combo.clear()
-        if node is None:
-            self.node_label.setText("No node selected")
-        else:
-            self.node_label.setText(node.path())
+        if node is not None:
             for parm in self._numeric_parms(node):
-                self.parm_combo.addItem(parm.description() or parm.name(), parm.path())
+                self.parm_combo.addItem(self._parm_label(parm), parm.path())
         self._building = False
         self.canvas.reset_view()
         self.refresh()
@@ -856,7 +1033,17 @@ class AnimationGraphEditor(QtWidgets.QWidget):
             self.canvas.reset_view()
             self.refresh()
 
+    @staticmethod
+    def _channel_color(parm):
+        node_type = parm.node().type().nameComponents()[2]
+        if node_type in ("xform", "transform") and parm.name() in (
+                "tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"):
+            return {"x": "#ef5350", "y": "#66bb6a", "z": "#529cff"}[parm.name()[-1]]
+        return "#ff9d36"
+
     def refresh(self):
+        self._refresh_timer.stop()
+        self._sync_parm_list()
         parm = self._current_parm()
         if parm is None:
             self.canvas.set_curve([], lambda frame: 0.0)
@@ -864,7 +1051,7 @@ class AnimationGraphEditor(QtWidgets.QWidget):
             return
         try:
             keys = list(parm.keyframes())
-            self.canvas.set_curve(keys, parm.evalAtFrame)
+            self.canvas.set_curve(keys, parm.evalAtFrame, self._channel_color(parm))
             self._update_selection_info()
         except hou.Error as error:
             self.canvas.set_curve([], lambda frame: 0.0)
@@ -925,7 +1112,8 @@ class AnimationGraphEditor(QtWidgets.QWidget):
         self._drag_state = None
 
     def _modal_shortcuts(self):
-        return ([self.delete_shortcut, self.x_shortcut, self.select_all_shortcut, self.fit_shortcut]
+        return ([self.delete_shortcut, self.x_shortcut, self.select_all_shortcut, self.fit_shortcut,
+                   self.copy_shortcut, self.paste_shortcut]
                 + self.interpolation_shortcuts + self.transform_shortcuts)
 
     def _begin_tangent_transform(self):
@@ -1123,6 +1311,31 @@ class AnimationGraphEditor(QtWidgets.QWidget):
         except hou.Error as error:
             self._report_error("Could not delete selected keyframes", error)
 
+    def copy_selected_keys(self):
+        keys = self.canvas.selected_keys()
+        if keys:
+            self._copied_keys = [hou.Keyframe(key) for key in sorted(keys, key=lambda key: key.frame())]
+
+    def paste_keys(self):
+        parm = self._current_parm()
+        if parm is None or not self._copied_keys:
+            return
+        if self.canvas._active_handle is not None or self.canvas._key_dragging:
+            return
+        try:
+            offset = round(hou.frame()) - self._copied_keys[0].frame()
+            pasted = []
+            for source in self._copied_keys:
+                key = hou.Keyframe(source)
+                key.setFrame(round(source.frame() + offset))
+                pasted.append(key)
+            with hou.undos.group("Paste animation graph keys"):
+                parm.setKeyframes(pasted)
+            self.canvas.set_selected_frames(key.frame() for key in pasted)
+            self.refresh()
+        except hou.Error as error:
+            self._report_error("Could not paste keyframes", error)
+
     def select_all_keys(self):
         self.canvas.select_all()
 
@@ -1132,23 +1345,75 @@ class AnimationGraphEditor(QtWidgets.QWidget):
     def _on_graph_selection_changed(self, frames):
         self._update_selection_info()
 
+    @staticmethod
+    def _mode_icon(mode):
+        pixmap = QtGui.QPixmap(48, 40)
+        pixmap.setDevicePixelRatio(2)
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+        with QtGui.QPainter(pixmap) as painter:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#ffd16a"), 1.8))
+            path = QtGui.QPainterPath(QtCore.QPointF(2, 16))
+            if mode == "automatic":
+                path.cubicTo(13, 16, 11, 4, 22, 4)
+            elif mode == "constant":
+                path.lineTo(13, 16)
+                path.lineTo(13, 4)
+            path.lineTo(22, 4)
+            painter.drawPath(path)
+        return QtGui.QIcon(pixmap)
+
+    def _tangent_mode(self, index, side):
+        keys = self.canvas._keys
+        incoming = side == "in"
+        neighbor = keys[index - 1 if incoming else index + 1]
+        key = keys[index]
+        segment = neighbor if incoming else key
+        try:
+            if segment.expressionLanguage() != hou.exprLanguage.Hscript:
+                return None
+            expression = segment.expression().strip()
+            if expression in ("constant()", "linear()"):
+                return expression[:-2]
+            if expression != "bezier()":
+                return None
+            auto = key.isInSlopeAuto() if incoming and not key.isSlopeTied() else key.isSlopeAuto()
+            if not auto:
+                slope = key.inSlope() if incoming and not key.isSlopeTied() else key.slope()
+                chord = hou.fps() * (neighbor.value() - key.value()) / (neighbor.frame() - key.frame())
+                if math.isclose(slope, chord, rel_tol=1e-6, abs_tol=1e-7):
+                    return "linear"
+            return "automatic"
+        except hou.KeyframeValueNotSet:
+            return None
+
+    def _update_mode_buttons(self):
+        frames = self.canvas.selected_frames
+        sides = self.canvas.selected_handles
+        keys = self.canvas._keys
+        modes = set()
+        for index, key in enumerate(keys):
+            if key.frame() in frames:
+                if index > 0 and (not sides or "in" in sides):
+                    modes.add(self._tangent_mode(index, "in"))
+                if index + 1 < len(keys) and (not sides or "out" in sides):
+                    modes.add(self._tangent_mode(index, "out"))
+        for mode, button in self.mode_buttons.items():
+            button.setEnabled(bool(frames))
+            button.setChecked(modes == {mode})
+
     def _update_selection_info(self):
+        self._update_mode_buttons()
         keys = self.canvas.selected_keys()
-        if not keys:
-            self.selection_info.setText("No keys selected.")
-        elif len(keys) == 1:
+        if len(keys) == 1:
             key = keys[0]
-            self.selection_info.setText(
-                "Selected key — Frame: {:.0f}   Value: {:.6g}   Tangents: {}".format(
-                    key.frame(), key.value(),
-                    "Tied" if key.isSlopeTied() and key.isAccelTied() else "Untied"
-                )
-            )
-            if self.canvas.selected_handles:
-                sides = ", ".join(sorted(self.canvas.selected_handles))
-                self.selection_info.setText(self.selection_info.text() + " — Selected tangent: " + sides)
+            text = "f: {:.0f}   v: {:.6g}".format(key.frame(), key.value())
+        elif keys:
+            text = "{} keys selected".format(len(keys))
         else:
-            self.selection_info.setText("{} keys selected.".format(len(keys)))
+            text = ""
+        self.canvas._selection_text = text
+        self.canvas.update()
 
     @staticmethod
     def _report_error(action, error):
